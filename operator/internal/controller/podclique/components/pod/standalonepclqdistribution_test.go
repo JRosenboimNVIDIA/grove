@@ -17,6 +17,9 @@ package pod
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -594,38 +597,60 @@ func TestReconcileStandalonePCLQDistributionCreateAndDelete(t *testing.T) {
 		require.Error(t, err)
 	})
 
-	t.Run("redistribution deletes from the shrinking anchor and creates on the growing anchor", func(t *testing.T) {
-		anchor1 := podGangNameForEpoch(testAnchor1Epoch)
-		pclq := newPCLQ(3)
-		// anchor0 currently holds all 3 pods; the redistribution moves to anchor0:1, anchor1:2. The live
-		// pods carry hostname indices so creating the replacements can pick free indices.
-		live := []*corev1.Pod{
-			nonTerminatingPodInPodGang("pod-a", anchor0, "worker-0"),
-			nonTerminatingPodInPodGang("pod-b", anchor0, "worker-1"),
-			nonTerminatingPodInPodGang("pod-c", anchor0, "worker-2"),
-		}
-		cl := testutils.NewTestClientBuilder().WithObjects(pclq, live[0], live[1], live[2]).Build()
-		r := _resource{client: cl, scheme: cl.Scheme(), schedRegistry: registry, eventRecorder: record.NewFakeRecorder(64), expectationsStore: expect.NewExpectationsStore()}
-		ss := &syncSnapshot{
-			pcs: testPCS, pclq: pclq, pcsReplicaIndex: testPCSReplicaIndex, cliqueName: testCliqueName,
-			pgm: pgmWithEntries(
-				anchorEntryWithCliques(testAnchor0Epoch, map[string]int32{testCliqueName: 1}),
-				anchorEntryWithCliques(testAnchor1Epoch, map[string]int32{testCliqueName: 2}),
-			),
-			existingPCLQPods: live,
-		}
+	for _, tc := range []struct {
+		name     string
+		replicas int32
+		retained int32
+	}{
+		{name: "redistribution preserves indices when replacing two of three pods", replicas: 3, retained: 1},
+		{name: "redistribution preserves index zero when replacing a single pod", replicas: 1, retained: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			anchor1 := podGangNameForEpoch(testAnchor1Epoch)
+			pclq := newPCLQ(tc.replicas)
+			live := make([]*corev1.Pod, 0, tc.replicas)
+			objects := []client.Object{pclq}
+			wantHostnames := make([]string, 0, tc.replicas)
+			for i := 0; i < int(tc.replicas); i++ {
+				hostname := fmt.Sprintf("%s-%d", pclq.Name, i)
+				pod := nonTerminatingPodInPodGang(fmt.Sprintf("old-%d", i), anchor0, hostname)
+				pod.Labels[apicommon.LabelPodCliquePodIndex] = strconv.Itoa(i)
+				live = append(live, pod)
+				objects = append(objects, pod)
+				wantHostnames = append(wantHostnames, hostname)
+			}
+			cl := testutils.NewTestClientBuilder().WithObjects(objects...).Build()
+			r := _resource{client: cl, scheme: cl.Scheme(), schedRegistry: registry, eventRecorder: record.NewFakeRecorder(64), expectationsStore: expect.NewExpectationsStore()}
+			ss := &syncSnapshot{
+				pcs: testPCS, pclq: pclq, pcsReplicaIndex: testPCSReplicaIndex, cliqueName: testCliqueName,
+				pgm: pgmWithEntries(
+					anchorEntryWithCliques(testAnchor0Epoch, map[string]int32{testCliqueName: tc.retained}),
+					anchorEntryWithCliques(testAnchor1Epoch, map[string]int32{testCliqueName: tc.replicas - tc.retained}),
+				),
+				existingPCLQPods: live,
+			}
 
-		err := r.reconcileStandalonePCLQDistribution(context.Background(), logr.Discard(), ss)
-		require.NoError(t, err)
+			originalPods := slices.Clone(live)
+			require.NoError(t, r.reconcileStandalonePCLQDistribution(context.Background(), logr.Discard(), ss))
 
-		assert.Len(t, listPodsForPodGang(t, cl, anchor0), 1)
-		assert.Len(t, listPodsForPodGang(t, cl, anchor1), 2)
-	})
+			oldPods := listPodsForPodGang(t, cl, anchor0)
+			newPods := listPodsForPodGang(t, cl, anchor1)
+			assert.Len(t, oldPods, int(tc.retained))
+			assert.Len(t, newPods, int(tc.replicas-tc.retained))
+			var gotHostnames []string
+			for _, pod := range slices.Concat(oldPods, newPods) {
+				gotHostnames = append(gotHostnames, pod.Spec.Hostname)
+				assert.Equal(t, pclq.Name+"-"+pod.Labels[apicommon.LabelPodCliquePodIndex], pod.Spec.Hostname)
+			}
+			assert.ElementsMatch(t, wantHostnames, gotHostnames)
+			assert.Equal(t, originalPods, ss.existingPCLQPods, "index allocation must not change the snapshot")
+		})
+	}
 
 	t.Run("redistribution creates no replacements when the delete on the shrinking anchor fails", func(t *testing.T) {
 		anchor1 := podGangNameForEpoch(testAnchor1Epoch)
 		pclq := newPCLQ(3)
-		live := []*corev1.Pod{nonTerminatingPodInPodGang("pod-a", anchor0, ""), nonTerminatingPodInPodGang("pod-b", anchor0, ""), nonTerminatingPodInPodGang("pod-c", anchor0, "")}
+		live := []*corev1.Pod{nonTerminatingPodInPodGang("pod-a", anchor0, "worker-0"), nonTerminatingPodInPodGang("pod-b", anchor0, "worker-1"), nonTerminatingPodInPodGang("pod-c", anchor0, "worker-2")}
 		cl := testutils.NewTestClientBuilder().WithObjects(pclq, live[0], live[1], live[2]).
 			RecordErrorForObjects(testutils.ClientMethodDelete, apierrors.NewInternalError(errors.New("boom")), client.ObjectKeyFromObject(live[0]), client.ObjectKeyFromObject(live[1]), client.ObjectKeyFromObject(live[2])).
 			Build()
@@ -640,7 +665,7 @@ func TestReconcileStandalonePCLQDistributionCreateAndDelete(t *testing.T) {
 		}
 
 		err := r.reconcileStandalonePCLQDistribution(context.Background(), logr.Discard(), ss)
-		require.Error(t, err)
+		require.ErrorContains(t, err, "boom")
 		// Deletes run before creates, so a delete failure short-circuits before any replacement is created.
 		assert.Empty(t, listPodsForPodGang(t, cl, anchor1))
 	})
@@ -705,33 +730,32 @@ func TestSumCounts(t *testing.T) {
 	}
 }
 
-// TestBuildPerPodGangDeletionTasks verifies one deletion task is built per excess pod, that the
+// TestSelectPerPodGangPodsToDelete verifies one pod is selected per excess pod, that the
 // DeletionSorter prefers the Pending pod, and that non-negative deltas and empty groups build no
-// tasks.
-func TestBuildPerPodGangDeletionTasks(t *testing.T) {
-	r := &_resource{expectationsStore: expect.NewExpectationsStore()}
+// selections.
+func TestSelectPerPodGangPodsToDelete(t *testing.T) {
 	ss := &syncSnapshot{pcs: pcs(), pclq: pclqWithReplicas(1), cliqueName: testCliqueName}
 
-	t.Run("builds one task per excess pod picking the Pending pod first", func(t *testing.T) {
+	t.Run("selects the Pending pod first", func(t *testing.T) {
 		pending := testutils.NewPodBuilder("pod-pending", testNamespace).WithPhase(corev1.PodPending).Build()
 		running := testutils.NewPodBuilder("pod-running", testNamespace).WithPhase(corev1.PodRunning).Build()
 		podsByPodGang := map[string]podGangPods{"pg-a": {nonTerminating: []*corev1.Pod{running, pending}}}
 
-		tasks := r.buildPerPodGangDeletionTasks(logr.Discard(), ss, map[string]int32{"pg-a": -1}, []string{"pg-a"}, podsByPodGang)
+		selected := selectPerPodGangPodsToDelete(ss, map[string]int32{"pg-a": -1}, []string{"pg-a"}, podsByPodGang)
 
-		require.Len(t, tasks, 1)
-		assert.Contains(t, tasks[0].Name, "pod-pending")
+		require.Len(t, selected, 1)
+		assert.Same(t, pending, selected[0])
 	})
 
 	t.Run("skips a PodGang whose delta is non-negative", func(t *testing.T) {
 		podsByPodGang := map[string]podGangPods{"pg-a": {nonTerminating: []*corev1.Pod{nonTerminatingPodInPodGang("pod-a", "pg-a", "")}}}
-		tasks := r.buildPerPodGangDeletionTasks(logr.Discard(), ss, map[string]int32{"pg-a": 0}, []string{"pg-a"}, podsByPodGang)
-		assert.Empty(t, tasks)
+		selected := selectPerPodGangPodsToDelete(ss, map[string]int32{"pg-a": 0}, []string{"pg-a"}, podsByPodGang)
+		assert.Empty(t, selected)
 	})
 
 	t.Run("skips a PodGang with no live pods", func(t *testing.T) {
-		tasks := r.buildPerPodGangDeletionTasks(logr.Discard(), ss, map[string]int32{"pg-a": -2}, []string{"pg-a"}, map[string]podGangPods{})
-		assert.Empty(t, tasks)
+		selected := selectPerPodGangPodsToDelete(ss, map[string]int32{"pg-a": -2}, []string{"pg-a"}, map[string]podGangPods{})
+		assert.Empty(t, selected)
 	})
 }
 
@@ -742,13 +766,13 @@ func TestBuildPerPodGangCreationTasks(t *testing.T) {
 	ss := &syncSnapshot{pcs: pcs(), pclq: pclqWithReplicas(1), cliqueName: testCliqueName}
 
 	t.Run("builds one task per deficit pod across PodGangs", func(t *testing.T) {
-		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": 2, "pg-b": 1}, []string{"pg-a", "pg-b"})
+		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": 2, "pg-b": 1}, []string{"pg-a", "pg-b"}, nil)
 		require.NoError(t, err)
 		assert.Len(t, tasks, 3)
 	})
 
 	t.Run("builds no tasks when there is no deficit", func(t *testing.T) {
-		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": -1}, []string{"pg-a"})
+		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": -1}, []string{"pg-a"}, nil)
 		require.NoError(t, err)
 		assert.Nil(t, tasks)
 	})

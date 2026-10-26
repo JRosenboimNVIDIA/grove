@@ -329,7 +329,7 @@ func (r _resource) applyCountDeltaByPodGang(ctx context.Context, logger logr.Log
 // buildPerPodGangCreationTasks builds creation tasks for each PodGang whose desired count exceeds the
 // effective count, assigning each new pod a host-name index. Each task records its create expectation
 // under the PodGang-scoped expectations key.
-func (r _resource) buildPerPodGangCreationTasks(logger logr.Logger, ss *syncSnapshot, countDeltaByPodGang map[string]int32, orderedPodGangNames []string, podsDeletedFirst []*corev1.Pod) ([]utils.Task, error) {
+func (r _resource) buildPerPodGangCreationTasks(logger logr.Logger, ss *syncSnapshot, countDeltaByPodGang map[string]int32, orderedPodGangNames []string, podsSelectedForDeletion []*corev1.Pod) ([]utils.Task, error) {
 	var totalToCreate int32
 	for _, delta := range countDeltaByPodGang {
 		if delta > 0 {
@@ -342,7 +342,7 @@ func (r _resource) buildPerPodGangCreationTasks(logger logr.Logger, ss *syncSnap
 	// The selected pods are deleted before any creation task runs, so their replacements can reuse
 	// their indices. Keep the original snapshot unchanged for the rest of this reconciliation.
 	deletedNames := sets.New[string]()
-	for _, pod := range podsDeletedFirst {
+	for _, pod := range podsSelectedForDeletion {
 		deletedNames.Insert(pod.Name)
 	}
 	remainingPods := lo.Reject(ss.existingPCLQPods, func(pod *corev1.Pod, _ int) bool {
